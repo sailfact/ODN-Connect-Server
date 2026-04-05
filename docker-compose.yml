@@ -1,0 +1,112 @@
+version: "3.9"
+
+services:
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - certs:/etc/nginx/certs:ro
+    depends_on:
+      - backend
+      - frontend
+    networks:
+      - vpn-net
+    restart: unless-stopped
+
+  wireguard:
+    image: linuxserver/wireguard:latest
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    environment:
+      - PUID=1000
+      - PGID=1000
+      - TZ=UTC
+    volumes:
+      - wg-config:/config
+      - /lib/modules:/lib/modules:ro
+    ports:
+      - "51820:51820/udp"
+    sysctls:
+      - net.ipv4.conf.all.src_valid_mark=1
+    networks:
+      - vpn-net
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      - DATABASE_URL=${DATABASE_URL}
+      - REDIS_URL=${REDIS_URL}
+      - JWT_SECRET=${JWT_SECRET}
+      - JWT_ACCESS_TTL=${JWT_ACCESS_TTL:-900}
+      - JWT_REFRESH_TTL=${JWT_REFRESH_TTL:-604800}
+      - WG_INTERFACE=${WG_INTERFACE:-wg0}
+      - WG_CONFIG_PATH=/etc/wireguard/wg0.conf
+      - WG_SUBNET=${WG_SUBNET:-10.8.0.0/24}
+      - WG_DNS=${WG_DNS:-1.1.1.1,1.0.0.1}
+      - WG_SERVER_PUBLIC_IP=${WG_SERVER_PUBLIC_IP}
+      - WG_PORT=${WG_PORT:-51820}
+      - ODN_CLIENT_SELF_SERVICE=${ODN_CLIENT_SELF_SERVICE:-true}
+      - ODN_SERVER_NAME=${ODN_SERVER_NAME:-My VPN}
+    volumes:
+      - wg-config:/etc/wireguard
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    networks:
+      - vpn-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    networks:
+      - vpn-net
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      - POSTGRES_DB=${POSTGRES_DB:-vpn}
+      - POSTGRES_USER=${POSTGRES_USER:-vpn}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    networks:
+      - vpn-net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-vpn}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - vpn-net
+    restart: unless-stopped
+
+networks:
+  vpn-net:
+    driver: bridge
+
+volumes:
+  wg-config:
+  pg-data:
+  redis-data:
+  certs:
