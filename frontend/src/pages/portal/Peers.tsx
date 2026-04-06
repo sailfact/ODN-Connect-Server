@@ -5,11 +5,9 @@ import { Download, Trash2, Plus, QrCode } from "lucide-react";
 import { QRCodeSVG } from "qrcode.react";
 import { listMyPeers, createMyPeer, deleteMyPeer, getPeerConfigUrl, type Peer } from "../../api/peers";
 import { api } from "../../api/client";
-import { useAuthStore } from "../../store/auth";
 
 export default function PortalPeers() {
   const qc = useQueryClient();
-  const { accessToken } = useAuthStore();
   const [newName, setNewName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [qrConfig, setQrConfig] = useState<{ name: string; content: string } | null>(null);

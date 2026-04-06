@@ -8,7 +8,6 @@ import { useAuthStore } from "../store/auth";
 export default function LoginPage() {
   const navigate = useNavigate();
   const setTokens = useAuthStore((s) => s.setTokens);
-  const role = useAuthStore((s) => s.role);
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");

@@ -3,10 +3,8 @@ import { useMutation } from "@tanstack/react-query";
 import toast from "react-hot-toast";
 import { QRCodeSVG } from "qrcode.react";
 import { setupTotp, confirmTotp } from "../../api/users";
-import { useAuthStore } from "../../store/auth";
 
 export default function PortalProfile() {
-  const { userId } = useAuthStore();
   const [totpSetup, setTotpSetup] = useState<{ secret: string; uri: string } | null>(null);
   const [totpCode, setTotpCode] = useState("");
 
