@@ -1,9 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, status, Request
+from fastapi import APIRouter, Depends, HTTPException, status, Request, Response
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 from datetime import datetime, timezone
+from email.utils import format_datetime, parsedate_to_datetime
 
 from app.db.session import get_db
 from app.core.deps import get_current_user, require_admin
@@ -31,6 +32,15 @@ class PeerOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class PeerCreatedOut(PeerOut):
+    """
+    Returned only by the create endpoints. Includes the preshared key so
+    ODN Connect can build a .conf that matches the PSK written to wg0.conf.
+    List/read endpoints never expose it.
+    """
+    preshared_key: str | None = None
 
 
 class PeerCreate(BaseModel):
@@ -61,7 +71,7 @@ async def list_peers(admin: User = Depends(require_admin), db: AsyncSession = De
     return result.scalars().all()
 
 
-@router.post("/api/peers", response_model=PeerOut, status_code=status.HTTP_201_CREATED)
+@router.post("/api/peers", response_model=PeerCreatedOut, status_code=status.HTTP_201_CREATED)
 async def create_peer(
     body: PeerCreate,
     request: Request,
@@ -69,13 +79,14 @@ async def create_peer(
     db: AsyncSession = Depends(get_db),
 ):
     wg = WgManager()
-    pub_key, psk = await wg.generate_peer_keys(body.public_key)
+    priv_key, pub_key, psk = await wg.generate_peer_keys(body.public_key)
     assigned_ip = await allocate_ip(db, settings.WG_SUBNET)
 
     peer = Peer(
         user_id=admin.id,
         name=body.name,
         public_key=pub_key,
+        private_key=priv_key,
         preshared_key=psk,
         allowed_ips=body.allowed_ips,
         assigned_ip=assigned_ip,
@@ -148,6 +159,7 @@ async def list_my_peers(user: User = Depends(get_current_user), db: AsyncSession
 @router.get("/api/me/peers/{peer_id}/config")
 async def get_peer_config(
     peer_id: str,
+    request: Request,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
@@ -156,10 +168,25 @@ async def get_peer_config(
     if not peer:
         raise HTTPException(status_code=404, detail="Peer not found")
 
+    # HTTP dates have second precision — truncate before comparing
+    modified_at = (peer.updated_at or peer.created_at).replace(microsecond=0)
+    if modified_at.tzinfo is None:
+        modified_at = modified_at.replace(tzinfo=timezone.utc)
+    last_modified = format_datetime(modified_at, usegmt=True)
+
+    # ODN Connect polls with If-Modified-Since every 30s — answer 304 when
+    # unchanged so the client doesn't rewrite the .conf and re-run wg syncconf.
+    ims = request.headers.get("if-modified-since")
+    if ims:
+        try:
+            if modified_at <= parsedate_to_datetime(ims):
+                return Response(status_code=status.HTTP_304_NOT_MODIFIED)
+        except (TypeError, ValueError):
+            pass
+
     wg = WgManager()
     config = await wg.render_client_config(peer)
 
-    last_modified = peer.created_at.strftime("%a, %d %b %Y %H:%M:%S GMT")
     return PlainTextResponse(
         content=config,
         headers={
@@ -170,7 +197,7 @@ async def get_peer_config(
     )
 
 
-@router.post("/api/me/peers", response_model=PeerOut, status_code=status.HTTP_201_CREATED)
+@router.post("/api/me/peers", response_model=PeerCreatedOut, status_code=status.HTTP_201_CREATED)
 async def create_my_peer(
     body: PeerCreate,
     request: Request,
@@ -181,13 +208,14 @@ async def create_my_peer(
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Self-service peer creation is disabled")
 
     wg = WgManager()
-    pub_key, psk = await wg.generate_peer_keys(body.public_key)
+    priv_key, pub_key, psk = await wg.generate_peer_keys(body.public_key)
     assigned_ip = await allocate_ip(db, settings.WG_SUBNET)
 
     peer = Peer(
         user_id=user.id,
         name=body.name,
         public_key=pub_key,
+        private_key=priv_key,
         preshared_key=psk,
         allowed_ips=body.allowed_ips,
         assigned_ip=assigned_ip,

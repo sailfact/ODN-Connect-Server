@@ -12,6 +12,9 @@ class Peer(Base):
     user_id: Mapped[str] = mapped_column(String(36), ForeignKey("users.id"), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     public_key: Mapped[str] = mapped_column(String(64), unique=True, nullable=False)
+    # Only set for server-generated peers (admin/portal flows). Self-service peers
+    # created by ODN Connect keep their private key on the client device.
+    private_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     preshared_key: Mapped[str | None] = mapped_column(String(64), nullable=True)
     allowed_ips: Mapped[str] = mapped_column(String(255), default="0.0.0.0/0", nullable=False)
     assigned_ip: Mapped[str] = mapped_column(String(45), unique=True, nullable=False)
@@ -21,6 +24,14 @@ class Peer(Base):
     client_label: Mapped[str | None] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+    # Bumped whenever config-relevant fields change — drives the Last-Modified /
+    # If-Modified-Since contract on /api/me/peers/{id}/config for ODN Connect.
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(timezone.utc),
+        onupdate=lambda: datetime.now(timezone.utc),
+        nullable=False,
     )
 
     user: Mapped["User"] = relationship("User", back_populates="peers")

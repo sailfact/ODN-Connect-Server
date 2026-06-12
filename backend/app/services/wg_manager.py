@@ -22,12 +22,17 @@ class WgManager:
 
     # ── Key generation ────────────────────────────────────────────────────────
 
-    async def generate_peer_keys(self, supplied_public_key: Optional[str] = None) -> tuple[str, str]:
+    async def generate_peer_keys(
+        self, supplied_public_key: Optional[str] = None
+    ) -> tuple[Optional[str], str, str]:
         """
-        Returns (public_key, preshared_key).
-        If the client supplied its own public key (self-service flow), use it.
-        Otherwise generate a new keypair — the private key is stored nowhere.
+        Returns (private_key, public_key, preshared_key).
+        If the client supplied its own public key (ODN Connect self-service flow),
+        private_key is None — the client keeps it and the server never sees it.
+        Otherwise a keypair is generated and the private key is returned so it can
+        be stored for portal/web config downloads.
         """
+        privkey: Optional[str] = None
         if supplied_public_key:
             pub_key = supplied_public_key.strip()
         else:
@@ -55,7 +60,7 @@ class WgManager:
         stdout, _ = await proc.communicate()
         psk = stdout.decode().strip()
 
-        return pub_key, psk
+        return privkey, pub_key, psk
 
     async def get_server_public_key(self) -> str:
         """Read the server's public key from the wg interface or config file."""
@@ -175,6 +180,9 @@ DNS = {settings.WG_DNS}
         lines = [
             "[Interface]",
             f"# {peer.name}",
+            # Self-service peers have no server-side private key — ODN Connect
+            # holds it locally and re-injects it when syncing this config.
+            *([f"PrivateKey = {peer.private_key}"] if peer.private_key else []),
             f"Address = {peer.assigned_ip}/32",
             f"DNS = {peer.dns or settings.WG_DNS}",
             "",
