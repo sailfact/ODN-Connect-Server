@@ -33,7 +33,19 @@ This document describes both what exists and what is planned. Current state:
   NGINX TLS + rate limiting + security headers, Alembic migrations + admin seed,
   `generate-keys.sh`, `backup-db.sh`
 - Extra endpoints not in the table below: `GET /api/health` (public),
-  `POST /api/admin/me/totp/setup`, `POST /api/admin/me/totp/confirm`
+  `POST /api/admin/me/totp/setup`, `POST /api/admin/me/totp/confirm`,
+  `DELETE /api/admin/users/{id}/totp` (admin TOTP recovery; self-reset blocked —
+  locked-out admins use `python manage.py reset-totp <email>`)
+- P1 hardening: peer input validation (name charset guards against wg0.conf
+  stanza injection, WG key format, CIDR/DNS parsing), typed TOTP confirm body,
+  Postgres advisory lock in IP allocation, `last_handshake` persisted on
+  `/api/status` and `/api/me/peers` reads, shared Redis pool
+  (`app/core/redis.py`), backend rate limiting on `/login` + `/refresh`
+  (`app/core/ratelimit.py`, fails open if Redis is down), production guard
+  refusing default/short `JWT_SECRET` (`ENVIRONMENT=production`), `CORS_ORIGINS`
+  env var, `/api/docs` disabled in production, uniform auth errors (disabled
+  accounts and revoked refresh tokens are indistinguishable from bad
+  credentials), CSP header in NGINX
 
 **Not yet built (planned)**
 - OIDC SSO (env vars exist; no code)
@@ -42,29 +54,26 @@ This document describes both what exists and what is planned. Current state:
 - `config-watcher` sidecar (backend calls `wg syncconf` directly — acceptable interim)
 - Admin Settings page (self-service toggle is env-only: `ODN_CLIENT_SELF_SERVICE`)
 - Audit log search/filter UI (backend filters exist; frontend shows last 100)
-- CSP header in NGINX; CI pipeline (no `.github/workflows`)
-- Tests beyond two thin contract tests in `backend/tests/client_api/` and one
-  frontend store test
+- CI pipeline (no `.github/workflows`)
+- Integration/E2E tests (current coverage: contract tests in
+  `backend/tests/client_api/`, unit tests in `backend/tests/unit/`, one
+  frontend store test)
 
 **Known gaps to fix (see Current priorities)**
-- `last_handshake` is never persisted to the DB (status endpoint reads `wg show`
-  live but does not write back) — treat live polling as the source of truth for now
-- IP allocation is read-then-write (race under concurrent peer creation)
-- `confirm_totp` accepts an untyped `dict` body; peer `name`/`allowed_ips`/`dns`
-  are unvalidated; peer list endpoints are unpaginated
-- Per-request Redis connections in `routers/auth.py`; `/api/auth/refresh` is not
-  rate-limited; `JWT_SECRET` default is accepted at startup; CORS is hardcoded `*`
-- Rate limiting lives in NGINX only (not in backend code)
+- Peer list endpoints are unpaginated
+- `last_handshake` persistence piggybacks on `/api/status` and `/api/me/peers`
+  reads — no background poller, so values go stale if nothing polls
 
 ## Current priorities & roadmap
 
 - **P0 / Milestone 1 — Stabilize**: green frontend build (done: Vite 8 +
   plugin-react 6 + Vitest 4 + jsdom, no `--legacy-peer-deps`), add CI, grow the
   contract/unit test suites
-- **P1 / Milestone 2 — Harden**: input validation (peer name, CIDRs, headers),
-  IP-allocation locking/retry, persist `last_handshake`, shared Redis pool,
-  rate-limit `/refresh`, refuse default `JWT_SECRET`, `CORS_ORIGINS` env var,
-  disable `/api/docs` in prod, uniform auth errors, CSP header, admin TOTP recovery
+- **P1 / Milestone 2 — Harden** (done): input validation, IP-allocation
+  locking, persist `last_handshake`, shared Redis pool, rate-limit
+  `/login`+`/refresh`, refuse default `JWT_SECRET` in production,
+  `CORS_ORIGINS` env var, disable `/api/docs` in prod, uniform auth errors,
+  CSP header, admin TOTP recovery (endpoint + `manage.py reset-totp`)
 - **P2 / Milestone 3 — Feature-complete v1.0**: password change endpoint + UI,
   audit filter UI, pagination, implement-or-drop OIDC, full ODN Connect E2E test
 - **P3 / Milestone 4 — Operate**: Certbot automation, compose healthchecks,
@@ -166,7 +175,7 @@ users
 peers
   id, user_id (FK), name, public_key, preshared_key,
   allowed_ips, assigned_ip, dns, enabled,
-  last_handshake (column exists; not yet persisted — see Implementation status),
+  last_handshake (persisted on /api/status and /api/me/peers reads),
   created_at,
   client_label (optional — e.g. "Ross's MacBook", set by ODN Connect)
 
@@ -294,10 +303,11 @@ Do not expose sensitive information here — no private keys, no peer list.
 
 ODN Connect polls `GET /api/me/peers` every 30 seconds to refresh last handshake
 times displayed in the client UI. This supplements (not replaces) the local
-`wg show` polling the Tunnel Service does. Note: the server does not yet persist
-`last_handshake` to the DB (the `/api/status` endpoint reads `wg show` live), so
-until that lands the client's local polling is the practical source of truth;
-the intended design is for the server-side value to become canonical.
+`wg show` polling the Tunnel Service does. The server refreshes
+`last_handshake` from `wg show` and persists it whenever `/api/status` or
+`/api/me/peers` is read, so the value the client sees is current as of its own
+poll; local Tunnel Service polling still gives sub-30s connected/disconnected
+state.
 
 ### Client-side peer creation
 
@@ -363,7 +373,8 @@ Host port exposure:
 - TOTP enforced for admin accounts
 - JWT access tokens: 15-minute expiry; refresh tokens: 7 days
 - Rate-limiting on auth endpoints (5 req/min per IP) — enforced in NGINX
-  (`nginx/nginx.conf`), not in backend code; `/api/auth/refresh` not yet limited
+  (`nginx/nginx.conf`) and in the backend (`app/core/ratelimit.py`, Redis
+  fixed-window on `/login` and `/refresh`; fails open if Redis is down)
 - Admin routes protected by role middleware
 - Audit log immutable (append-only, no delete endpoint)
 - `NET_ADMIN` and `SYS_MODULE` capabilities scoped to wireguard container only
@@ -375,6 +386,10 @@ Host port exposure:
 ## Environment variables (`.env`)
 
 ```env
+# Runtime
+ENVIRONMENT=production    # refuses default/short JWT_SECRET, disables /api/docs
+CORS_ORIGINS=             # comma-separated; empty = same-origin only in prod
+
 # Postgres
 POSTGRES_DB=vpn
 POSTGRES_USER=vpn

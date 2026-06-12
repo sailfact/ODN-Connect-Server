@@ -63,9 +63,38 @@ def create_admin():
     asyncio.run(_create_admin())
 
 
+async def _reset_totp(email: str):
+    from app.db.session import AsyncSessionLocal
+    from app.models.user import User
+    from app.models.audit import AuditLog
+    from sqlalchemy import select
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(User).where(User.email == email))
+        user = result.scalar_one_or_none()
+        if not user:
+            print(f"No user with email {email}.")
+            sys.exit(1)
+        user.totp_secret = None
+        db.add(AuditLog(actor_id=None, action="totp_reset_cli", target_type="user",
+                        target_id=user.id, ip_address="localhost"))
+        await db.commit()
+        print(f"TOTP cleared for {email}. They can re-enroll via the portal "
+              f"(admins must re-enroll before next login).")
+
+
+def reset_totp():
+    """Recovery path for a locked-out admin — requires host/container access."""
+    if len(sys.argv) < 3:
+        print("Usage: python manage.py reset-totp <email>")
+        sys.exit(1)
+    asyncio.run(_reset_totp(sys.argv[2]))
+
+
 COMMANDS = {
     "init-wg": init_wg,
     "create-admin": create_admin,
+    "reset-totp": reset_totp,
 }
 
 if __name__ == "__main__":

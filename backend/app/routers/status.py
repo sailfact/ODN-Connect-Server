@@ -21,11 +21,11 @@ async def server_status(admin: User = Depends(require_admin), db: AsyncSession =
     enabled_result = await db.execute(select(func.count()).select_from(Peer).where(Peer.enabled == True))
     enabled_peers = enabled_result.scalar()
 
-    handshakes = await wg.get_handshakes()
+    handshakes = await wg.persist_handshakes(db)
 
     return {
         "total_peers": total_peers,
         "enabled_peers": enabled_peers,
         "interface": wg.interface,
-        "peer_handshakes": handshakes,
+        "peer_handshakes": {k: v.isoformat() for k, v in handshakes.items()},
     }

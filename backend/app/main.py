@@ -5,13 +5,15 @@ from fastapi.responses import JSONResponse
 
 from app.routers import auth, peers, users, status, client, audit
 from app.core.config import settings
+from app.core.redis import close_redis
+
+settings.validate_runtime()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: nothing async needed beyond DB (managed per-request)
     yield
-    # Shutdown
+    await close_redis()
 
 
 app = FastAPI(
@@ -19,14 +21,15 @@ app = FastAPI(
     description="WireGuard VPN management API",
     version="1.0.0",
     lifespan=lifespan,
-    docs_url="/api/docs",
-    redoc_url="/api/redoc",
-    openapi_url="/api/openapi.json",
+    # Interactive docs are development-only
+    docs_url=None if settings.is_production else "/api/docs",
+    redoc_url=None if settings.is_production else "/api/redoc",
+    openapi_url=None if settings.is_production else "/api/openapi.json",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten in production via env
+    allow_origins=settings.cors_origins_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

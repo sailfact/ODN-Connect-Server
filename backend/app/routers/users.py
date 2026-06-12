@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, Field
 import pyotp
 
 from app.db.session import get_db
@@ -36,6 +36,11 @@ class UserCreate(BaseModel):
 class PasswordChange(BaseModel):
     current_password: str
     new_password: str
+
+
+class TotpConfirm(BaseModel):
+    secret: str = Field(min_length=16, max_length=64, pattern=r"^[A-Z2-7]+$")  # base32
+    code: str = Field(min_length=6, max_length=8, pattern=r"^\d+$")
 
 
 async def _audit(db: AsyncSession, actor_id: str, action: str, ip: str, target_id: str | None = None):
@@ -104,16 +109,36 @@ async def setup_totp(user: User = Depends(get_current_user), db: AsyncSession = 
 
 @router.post("/me/totp/confirm", status_code=status.HTTP_204_NO_CONTENT)
 async def confirm_totp(
-    payload: dict,
+    body: TotpConfirm,
     user: User = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ):
-    secret = payload.get("secret")
-    code = payload.get("code")
-    if not secret or not code:
-        raise HTTPException(status_code=400, detail="secret and code required")
-    totp = pyotp.TOTP(secret)
-    if not totp.verify(code, valid_window=1):
+    totp = pyotp.TOTP(body.secret)
+    if not totp.verify(body.code, valid_window=1):
         raise HTTPException(status_code=400, detail="Invalid TOTP code")
-    user.totp_secret = secret
+    user.totp_secret = body.secret
     await db.commit()
+
+
+@router.delete("/users/{user_id}/totp", status_code=status.HTTP_204_NO_CONTENT)
+async def reset_user_totp(
+    user_id: str,
+    request: Request,
+    admin: User = Depends(require_admin),
+    db: AsyncSession = Depends(get_db),
+):
+    """Admin TOTP recovery: clear a user's TOTP so they can re-enroll.
+
+    Admins cannot reset their own TOTP here (it would bypass the second
+    factor with just a stolen access token) — a locked-out admin uses
+    `python manage.py reset-totp <email>` on the host instead.
+    """
+    if user_id == admin.id:
+        raise HTTPException(status_code=400, detail="Cannot reset your own TOTP; use manage.py reset-totp")
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    user.totp_secret = None
+    await db.commit()
+    await _audit(db, admin.id, "totp_reset", request.client.host, user_id)

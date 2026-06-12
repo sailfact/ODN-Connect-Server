@@ -203,7 +203,32 @@ DNS = {settings.WG_DNS}
                 parts = line.split("\t")
                 if len(parts) == 2:
                     pubkey, ts = parts
-                    handshakes[pubkey] = datetime.fromtimestamp(int(ts), tz=timezone.utc).isoformat()
+                    if int(ts) == 0:  # wg reports 0 for "never"
+                        continue
+                    handshakes[pubkey] = datetime.fromtimestamp(int(ts), tz=timezone.utc)
             return handshakes
         except (FileNotFoundError, ValueError):
             return {}
+
+    async def persist_handshakes(self, db) -> dict:
+        """Read live handshakes and write them back to peers.last_handshake.
+
+        Returns {public_key: datetime}. Commits only if something changed.
+        """
+        from sqlalchemy import select
+        from app.models.peer import Peer
+
+        handshakes = await self.get_handshakes()
+        if not handshakes:
+            return {}
+
+        result = await db.execute(select(Peer).where(Peer.public_key.in_(handshakes.keys())))
+        dirty = False
+        for peer in result.scalars().all():
+            ts = handshakes[peer.public_key]
+            if peer.last_handshake != ts:
+                peer.last_handshake = ts
+                dirty = True
+        if dirty:
+            await db.commit()
+        return handshakes

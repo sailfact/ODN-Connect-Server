@@ -1,8 +1,11 @@
+import ipaddress
+import re
+
 from fastapi import APIRouter, Depends, HTTPException, status, Request
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime, timezone
 
 from app.db.session import get_db
@@ -33,18 +36,94 @@ class PeerOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+# Peer names end up in wg0.conf comments and .conf filenames — restrict to a
+# safe charset (no newlines, brackets, slashes) to rule out config injection.
+PEER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 ._'-]{0,62}$")
+# WireGuard keys are 32 bytes base64-encoded: 43 chars + "="
+WG_KEY_RE = re.compile(r"^[A-Za-z0-9+/]{43}=$")
+
+
+def _validate_name(v: str) -> str:
+    v = v.strip()
+    if not PEER_NAME_RE.match(v):
+        raise ValueError(
+            "name must be 1-63 characters: letters, digits, spaces, . _ ' - "
+            "(must start with a letter or digit)"
+        )
+    return v
+
+
+def _validate_cidrs(v: str) -> str:
+    parts = [p.strip() for p in v.split(",") if p.strip()]
+    if not parts:
+        raise ValueError("allowed_ips must contain at least one CIDR")
+    for part in parts:
+        try:
+            ipaddress.ip_network(part, strict=False)
+        except ValueError:
+            raise ValueError(f"invalid CIDR: {part!r}")
+    return ", ".join(parts)
+
+
+def _validate_dns(v: str | None) -> str | None:
+    if v is None:
+        return None
+    parts = [p.strip() for p in v.split(",") if p.strip()]
+    for part in parts:
+        try:
+            ipaddress.ip_address(part)
+        except ValueError:
+            raise ValueError(f"invalid DNS server address: {part!r}")
+    return ",".join(parts) or None
+
+
 class PeerCreate(BaseModel):
     name: str
     public_key: str | None = None    # client supplies when self-service
     allowed_ips: str = "0.0.0.0/0"
     dns: str | None = None
-    client_label: str | None = None
+    client_label: str | None = Field(default=None, max_length=255)
+
+    @field_validator("name")
+    @classmethod
+    def name_valid(cls, v: str) -> str:
+        return _validate_name(v)
+
+    @field_validator("public_key")
+    @classmethod
+    def public_key_valid(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        if not WG_KEY_RE.match(v):
+            raise ValueError("public_key must be a base64-encoded 32-byte WireGuard key")
+        return v
+
+    @field_validator("allowed_ips")
+    @classmethod
+    def allowed_ips_valid(cls, v: str) -> str:
+        return _validate_cidrs(v)
+
+    @field_validator("dns")
+    @classmethod
+    def dns_valid(cls, v: str | None) -> str | None:
+        return _validate_dns(v)
 
 
 class PeerUpdate(BaseModel):
     enabled: bool | None = None
     name: str | None = None
     allowed_ips: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def name_valid(cls, v: str | None) -> str | None:
+        return None if v is None else _validate_name(v)
+
+    @field_validator("allowed_ips")
+    @classmethod
+    def allowed_ips_valid(cls, v: str | None) -> str | None:
+        return None if v is None else _validate_cidrs(v)
 
 
 async def _audit(db: AsyncSession, actor_id: str, action: str, ip: str, target_id: str | None = None, detail: dict | None = None):
@@ -141,6 +220,9 @@ async def update_peer(
 
 @router.get("/api/me/peers", response_model=list[PeerOut])
 async def list_my_peers(user: User = Depends(get_current_user), db: AsyncSession = Depends(get_db)):
+    # ODN Connect polls this for handshake times — refresh from wg first so
+    # the persisted value is current (no-op where wg isn't available)
+    await WgManager().persist_handshakes(db)
     result = await db.execute(select(Peer).where(Peer.user_id == user.id))
     return result.scalars().all()
 
