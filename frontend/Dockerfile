@@ -1,7 +1,8 @@
 FROM node:20-alpine AS base
 WORKDIR /app
 COPY package*.json ./
-RUN npm ci --legacy-peer-deps
+RUN npm ci
+
 # ── dev stage ──────────────────────────────────────────────────────────────
 FROM base AS dev
 # Source mounted at runtime
