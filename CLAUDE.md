@@ -165,9 +165,10 @@ users
 
 peers
   id, user_id (FK), name, public_key, preshared_key,
+  private_key (nullable — only for server-generated peers; self-service
+    peers created by ODN Connect keep their private key on the device),
   allowed_ips, assigned_ip, dns, enabled,
-  last_handshake (column exists; not yet persisted — see Implementation status),
-  created_at,
+  last_handshake (polled), created_at, updated_at (drives Last-Modified),
   client_label (optional — e.g. "Ross's MacBook", set by ODN Connect)
 
 audit_log

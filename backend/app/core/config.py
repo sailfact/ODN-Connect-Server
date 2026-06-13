@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     WG_SERVER_PUBLIC_IP: str = "127.0.0.1"
     WG_PORT: int = 51820
 
+    # TLS / public-facing hostname (used for api_base_url in server-info)
+    DOMAIN: str = ""
+
     # ODN Connect
     ODN_CLIENT_SELF_SERVICE: bool = True
     ODN_SERVER_NAME: str = "My VPN"
