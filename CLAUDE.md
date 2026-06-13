@@ -13,6 +13,65 @@ Connect consumes.
 
 ---
 
+## Implementation status
+
+This document describes both what exists and what is planned. Current state:
+
+**Implemented**
+- Auth: login/refresh/logout, JWT (HS256) with refresh rotation + Redis revocation,
+  bcrypt cost 12, TOTP (mandatory for admins, optional for users)
+- Peers: admin CRUD, user self-service CRUD, `.conf` download with `Last-Modified`,
+  per-peer preshared keys, atomic `wg0.conf` rewrite + `wg syncconf` hot-reload
+- Users: admin CRUD (with self-delete guard), TOTP setup/confirm
+- Audit log: append-only, written on auth/peer/user events, admin read endpoint
+  with `?action=&actor_id=&limit=&offset=` filters
+- ODN Connect contract: `/api/client/server-info`, config sync headers,
+  `ODNConnect/*` User-Agent audit tracking, client-supplied public keys
+- Frontend: Login, admin Dashboard/Peers/Users/Audit, portal Peers (QR + download)
+  and Profile (TOTP setup)
+- Infra: docker compose (nginx, wireguard, backend, frontend, postgres, redis),
+  NGINX TLS + rate limiting + security headers, Alembic migrations + admin seed,
+  `generate-keys.sh`, `backup-db.sh`
+- Extra endpoints not in the table below: `GET /api/health` (public),
+  `POST /api/admin/me/totp/setup`, `POST /api/admin/me/totp/confirm`
+
+**Not yet built (planned)**
+- OIDC SSO (env vars exist; no code)
+- Password change endpoint + portal form (Pydantic model exists; no route/UI)
+- Certbot / Let's Encrypt automation (manual cert mount only)
+- `config-watcher` sidecar (backend calls `wg syncconf` directly — acceptable interim)
+- Admin Settings page (self-service toggle is env-only: `ODN_CLIENT_SELF_SERVICE`)
+- Audit log search/filter UI (backend filters exist; frontend shows last 100)
+- CSP header in NGINX; CI pipeline (no `.github/workflows`)
+- Tests beyond two thin contract tests in `backend/tests/client_api/` and one
+  frontend store test
+
+**Known gaps to fix (see Current priorities)**
+- `last_handshake` is never persisted to the DB (status endpoint reads `wg show`
+  live but does not write back) — treat live polling as the source of truth for now
+- IP allocation is read-then-write (race under concurrent peer creation)
+- `confirm_totp` accepts an untyped `dict` body; peer `name`/`allowed_ips`/`dns`
+  are unvalidated; peer list endpoints are unpaginated
+- Per-request Redis connections in `routers/auth.py`; `/api/auth/refresh` is not
+  rate-limited; `JWT_SECRET` default is accepted at startup; CORS is hardcoded `*`
+- Rate limiting lives in NGINX only (not in backend code)
+
+## Current priorities & roadmap
+
+- **P0 / Milestone 1 — Stabilize**: green frontend build (done: Vite 8 +
+  plugin-react 6 + Vitest 4 + jsdom, no `--legacy-peer-deps`), add CI, grow the
+  contract/unit test suites
+- **P1 / Milestone 2 — Harden**: input validation (peer name, CIDRs, headers),
+  IP-allocation locking/retry, persist `last_handshake`, shared Redis pool,
+  rate-limit `/refresh`, refuse default `JWT_SECRET`, `CORS_ORIGINS` env var,
+  disable `/api/docs` in prod, uniform auth errors, CSP header, admin TOTP recovery
+- **P2 / Milestone 3 — Feature-complete v1.0**: password change endpoint + UI,
+  audit filter UI, pagination, implement-or-drop OIDC, full ODN Connect E2E test
+- **P3 / Milestone 4 — Operate**: Certbot automation, compose healthchecks,
+  HttpOnly-cookie refresh tokens, frontend error boundaries, admin Settings page
+
+---
+
 ## Architecture
 
 ```
@@ -71,18 +130,20 @@ Connect consumes.
 
 ### `auth`
 - Issues and validates JWTs
-- Supports local credentials + TOTP; optional OIDC SSO (Entra, Google, Okta)
+- Supports local credentials + TOTP; OIDC SSO (Entra, Google, Okta) is *planned,
+  not implemented* (env vars are reserved)
 - Refresh token rotation, session invalidation via Redis
+- Implemented inside the `backend` service (no separate auth container)
 
 ### `wg-manager`
 - Thin service (or library used directly by backend) that writes peer stanzas to
   the WireGuard config file and calls `wg syncconf` / `wg set` for hot-reload
 - No full tunnel restart needed for peer add/remove
 
-### `config-watcher`
-- Watches the `wg-config` volume for changes
-- Applies them live with `wg syncconf wg0 /etc/wireguard/wg0.conf`
-- Can be a sidecar on the `wireguard` container
+### `config-watcher` *(planned — not implemented)*
+- Would watch the `wg-config` volume for changes and apply them live with
+  `wg syncconf wg0 /etc/wireguard/wg0.conf` (sidecar on the `wireguard` container)
+- Today the backend calls `wg syncconf` directly after each config rewrite
 
 ### `postgres`
 - Stores: users, peers (public keys, IPs, labels), audit log, TOTP secrets
@@ -134,7 +195,12 @@ audit_log
 | DELETE | `/api/me/peers/{id}` | user | Delete own peer |
 | GET | `/api/admin/users` | admin | List users |
 | POST | `/api/admin/users` | admin | Create user |
+| DELETE | `/api/admin/users/{id}` | admin | Delete user (self-delete blocked) |
+| GET | `/api/admin/audit` | admin | Audit log (`?action=&actor_id=&limit=&offset=`) |
+| POST | `/api/admin/me/totp/setup` | user | Generate TOTP secret + provisioning URI |
+| POST | `/api/admin/me/totp/confirm` | user | Confirm and enable TOTP |
 | GET | `/api/status` | admin | Server + peer handshake status |
+| GET | `/api/health` | public | Liveness check |
 | GET | `/api/client/server-info` | public | Server public key, endpoint, DNS — for ODN Connect onboarding |
 
 ### ODN Connect client API notes
@@ -163,8 +229,9 @@ Token storage is handled by `electron-store` in the client. The server must:
 - View own peers and connection status
 - Download WireGuard `.conf` file
 - Show config as QR code (for mobile)
-- Self-service peer creation (toggle in admin settings)
-- Change password / manage TOTP
+- Self-service peer creation (enabled via `ODN_CLIENT_SELF_SERVICE` env var;
+  admin settings UI toggle is planned)
+- Manage TOTP (password change is planned — endpoint and UI not yet built)
 
 ---
 
@@ -228,9 +295,10 @@ Do not expose sensitive information here — no private keys, no peer list.
 
 ODN Connect polls `GET /api/me/peers` every 30 seconds to refresh last handshake
 times displayed in the client UI. This supplements (not replaces) the local
-`wg show` polling the Tunnel Service does. Server-side last_handshake is the
-canonical value shown in the UI; local polling is used for real-time connected/
-disconnected state detection.
+`wg show` polling the Tunnel Service does. Note: the server does not yet persist
+`last_handshake` to the DB (the `/api/status` endpoint reads `wg show` live), so
+until that lands the client's local polling is the practical source of truth;
+the intended design is for the server-side value to become canonical.
 
 ### Client-side peer creation
 
@@ -295,7 +363,8 @@ Host port exposure:
 - Passwords: bcrypt with cost ≥ 12
 - TOTP enforced for admin accounts
 - JWT access tokens: 15-minute expiry; refresh tokens: 7 days
-- Rate-limiting on auth endpoints (e.g. 5 req/min per IP)
+- Rate-limiting on auth endpoints (5 req/min per IP) — enforced in NGINX
+  (`nginx/nginx.conf`), not in backend code; `/api/auth/refresh` not yet limited
 - Admin routes protected by role middleware
 - Audit log immutable (append-only, no delete endpoint)
 - `NET_ADMIN` and `SYS_MODULE` capabilities scoped to wireguard container only
@@ -332,7 +401,7 @@ WG_DNS=1.1.1.1,1.0.0.1
 DOMAIN=vpn.example.com
 CERTBOT_EMAIL=admin@example.com
 
-# OIDC (optional)
+# OIDC (reserved — SSO not yet implemented)
 OIDC_ENABLED=false
 OIDC_ISSUER=
 OIDC_CLIENT_ID=
@@ -431,13 +500,19 @@ curl -H "Authorization: Bearer <token>" https://localhost/api/me/peers/<id>/conf
 
 ## Testing strategy
 
-- **Backend**: pytest with a test PostgreSQL instance; mock `wg` calls
-- **Frontend**: Vitest + React Testing Library
-- **Integration**: docker compose with `--profile test`; Playwright for E2E
-- **ODN Connect contract**: include a `tests/client_api/` suite that validates
-  the exact response shapes ODN Connect depends on — treat these as a
-  breaking-change guardrail
-- **Security**: run `trivy` on images in CI; `bandit` / `gosec` on backend
+Target state (current coverage is minimal — see Implementation status):
+
+- **Backend**: pytest with a test PostgreSQL instance; mock `wg` calls.
+  Today: two thin contract tests in `backend/tests/client_api/`
+  (`test_server_info.py`, `test_peer_config.py`); no conftest/test DB fixtures
+- **Frontend**: Vitest 4 + jsdom + React Testing Library (toolchain: Vite 8,
+  @vitejs/plugin-react 6, TypeScript 5.9). Today: one store unit test
+  (`src/store/auth.test.ts`)
+- **Integration**: docker compose with `--profile test`; Playwright for E2E (planned)
+- **ODN Connect contract**: grow `tests/client_api/` to validate the exact
+  response shapes ODN Connect depends on — treat these as a breaking-change
+  guardrail
+- **Security**: run `trivy` on images in CI; `bandit` on backend (CI not yet set up)
 
 ---
 
